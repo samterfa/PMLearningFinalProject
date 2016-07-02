@@ -1,0 +1,402 @@
+---
+title: "Machine Learning Final Project"
+subtitle: "Using Sensor Data to Inform Weight Lifting"
+author: "Sam Terfa"
+date: "July 2, 2016"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r setup1, echo = FALSE, message=FALSE, warning=FALSE}
+# A killPrefix hook.
+default_output_hook <- knitr::knit_hooks$get("output")
+knitr::knit_hooks$set( output = function(x, options) {
+
+  comment <- knitr::opts_current$get("comment")
+  if( is.na(comment) ) comment <- ""
+  can_null <- grepl( paste0( comment, "\\s*\\[\\d?\\]" ),
+                     x, perl = TRUE)
+  do_null <- isTRUE( knitr::opts_current$get("null_prefix") )
+  if( can_null && do_null ) {
+    # By default R print output aligns at the left brace.
+    align_index <- regexpr( "\\]", x )[1] - 1
+    # Two cases: start or newline
+    re <- paste0( "^.{", align_index, "}\\]")
+    rep <- comment
+    x <- gsub( re, rep,  x )
+    re <- paste0( "\\\n.{", align_index, "}\\]")
+    rep <- paste0( "\n", comment )
+    x <- gsub( re, rep,  x )
+  }
+  
+  default_output_hook( x, options )
+  
+})
+
+knitr::opts_template$set("kill_prefix"=list(comment=NA, null_prefix=TRUE))
+```
+
+
+```{r setup2, echo = FALSE, message=FALSE, warning=FALSE, cache=FALSE, eval=TRUE}  
+     require(ggplot2)
+     require(ggthemes)
+     require(doMC)
+     require(caret)
+     require(Rmisc)
+     require(gridExtra)
+     require(gmailr)
+     require(beepr)
+
+     ## Set the seed for reproducible randomized data.
+     set.seed(1234)
+     
+```
+
+```{r emailMe0, echo = FALSE, eval = FALSE, message=FALSE, warning=FALSE, cache=FALSE,cache.lazy=FALSE, opts.label="kill_prefix", tidy=FALSE, strip.white=TRUE, results='hide'}
+     
+     send_message(mime(from="samterfa@gmail.com", to="terfasam@minnehahaacademy.net",
+                  subject="Calculations Started!", "Your Calculations have Started"))
+``` 
+
+###Overview
+
+This project outlines a method for taking belt, forearm, arm, and dumbell acceleration and gyroscope measurements and predicting whether the intended exercise was done correctly or not. The data were collected by Groupware@LES.
+
+###Cleaning the Data
+
+The training data were first read in to create a data frame for the building data with exercise classifications marked A (correctly performed), as well as B - E (some type of incorrect performance of the exercise). The non-sensor data was removed from the data as well as measurement types with more than 10% missing values because model building and prediction are greatly impacted by missing values. Finally, several columns had numeric data in character format so those were converted for analysis.
+
+```{r readInData, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE, tidy=FALSE, fig.align='center', strip.white=TRUE}
+ 
+     projBuild <- read.csv("pml-training.csv", stringsAsFactors = FALSE)
+    
+     ## Change outcome variable to class factor for analysis.
+     projBuild$classe <- as.factor(projBuild$classe)
+     
+     ## 1st 7 columns are non-sensor data.
+     projBuild <- projBuild[,-(1:7)]
+     
+      ## Convert all character columns to numeric.
+     projBuild[,names(projBuild)[sapply(projBuild, class) == "character"]] <- 
+          sapply(projBuild[,names(projBuild)[
+          sapply(projBuild, class) == "character"]], function(x) 
+               x <- as.numeric(x))
+     
+     ## Several columns had a lot of missing values.
+     sapply(projBuild, function(x) paste(round(100*sum(is.na(x))/length(x),1),"% NAs",sep=""))
+     
+     ## Only keep sensor measurement types with less than 10% NA values.
+     projBuild <- projBuild[,names(projBuild)[sapply(projBuild, function(x) 100*sum(is.na(x))/length(x) < 10)]]
+     
+     ## Print out a table of the outcomes and counts for each outcome.
+     uniqueOutcomesTable <- table(projBuild$classe)
+     
+     ## Display a plot of the counts for each outcome (A-E) for the building
+     ## data set.
+     outcomesPlot <- ggplot(data.frame(uniqueOutcomesTable), aes(Var1, Freq)) + 
+          geom_bar(stat = "Identity", fill = "red") + 
+          labs(x="Unique Outcomes") + 
+          labs(y="Counts") + 
+          labs(title="Unique Outcomes Counts Plot") + 
+          theme_minimal() + 
+          theme(title = element_text(face = "bold", size=18),
+                plot.margin=unit(c(2,4,2,2),"lines"),
+                axis.title.x = element_text(margin = ggplot2::margin(25,0,0,0), size=16),
+                axis.title.y = element_text(margin = ggplot2::margin(0,25,0,0), size=16))
+
+     print(uniqueOutcomesTable)
+     print(outcomesPlot)
+  
+```
+
+###Anomolous Data
+
+Row 5373 has 3 high-leverage outliers in the gyros_forearm_y, gyros_forearm_z and gyros_dumbbell_z columns. This row was therefore removed.
+
+```{r dealWithOutliers, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE,cache.lazy=FALSE, fig.align="center", fig.width=9, fig.height = 4, tidy=FALSE, strip.white=TRUE}
+      
+     ## Identify only gyroscope data.
+     gyro <- projBuild[,names(projBuild)[grep("gyro", names(projBuild))]]
+     
+     ## Return which gyro data rows have the outlier.
+     sapply(projBuild[,names(projBuild)[
+          grep("gyro", names(projBuild))]], function(x) match(x[abs(x)>200],x))
+    
+     ## Create plots of each pair of correlated variables.
+     plotList <- list()
+     
+     plotList[[1]] <- 
+          ggplot(projBuild, aes(1,gyros_forearm_y)) + 
+          geom_boxplot(color = "red") + 
+          labs(x=NULL) + 
+          labs(y="gyros_forearem_y") + 
+          labs(title=NULL) + 
+          theme_minimal() + 
+          theme(title = element_text(face = "bold", size=12),
+               ## plot.margin=unit(c(2,4,2,2),"lines"),
+                axis.text.x = element_blank(),
+                axis.title.y = element_text(margin = ggplot2::margin(0,25,0,0), size=10))
+     
+     plotList[[2]] <- 
+          ggplot(projBuild, aes(1,gyros_forearm_z)) + 
+          geom_boxplot(color = "red") + 
+          labs(x=NULL) + 
+          labs(y="gyros_forearem_z") + 
+          labs(title=NULL) + 
+          theme_minimal() + 
+          theme(title = element_text(face = "bold", size=12),
+               ## plot.margin=unit(c(2,4,2,2),"lines"),
+                axis.text.x = element_blank(),
+                axis.title.y = element_text(margin = ggplot2::margin(0,25,0,0), size=10))
+     
+     plotList[[3]] <- 
+          ggplot(projBuild, aes(1,gyros_dumbbell_z)) + 
+          geom_boxplot(color = "red") + 
+          labs(x=NULL) + 
+          labs(y="gyros_dumbbell_z") + 
+          labs(title=NULL) + 
+          theme_minimal() + 
+          theme(title = element_text(face = "bold", size=12),
+              ##  plot.margin=unit(c(2,4,2,2),"lines"),
+                axis.text.x = element_blank(),
+                axis.title.y = element_text(margin = ggplot2::margin(0,25,0,0), size=10))
+     
+     ## And print the plots.
+     grid.arrange(plotList[[1]], plotList[[2]], ncol=2)
+     
+      ## Remove the offending row.
+     projBuild <- projBuild[-5373,]
+       
+```  
+
+###Correlated Variables
+
+Because there are 53 sensor variables being tracked on only 4 different areas of the body or equipment, there are several pairs of highly correlated variables. As can be seen below, 15 out of the remaining 53 sensor variables (about 28%) from the building data set are highly correlated (abs(r) > .8) with other variables. Any model for this data will need to use a weighted average approach to including predictor variables in order to overcome this.
+
+```{r correlatedVariables, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE,cache.lazy=FALSE, fig.align="center", fig.width=8, fig.height = 4, tidy=FALSE, strip.white=TRUE}
+      
+     ## Create matrix of correlations between all predictor variables.
+     M <- abs(cor(projBuild[,-length(projBuild[1,])])) 
+     
+     ## Transoform the matrix to lower triangular so that we get unique 
+     ## correlated variable pairs.
+     lowerTriangularM <- M*lower.tri(M, diag=FALSE)
+     
+     ## Create a table of correlated variable indices.
+     corVarsIndices <- which(lowerTriangularM > .8, arr.ind=TRUE)
+
+     ## Use the indices to grab the variable names and store them in a data frame.
+     correlatedVariables <- 
+          data.frame(rownames(M)[corVarsIndices[,1]],
+                     colnames(M)[corVarsIndices[,2]])
+     colnames(correlatedVariables) <- c("Var 1", "Var 2")
+     
+     ## Create plots of each pair of correlated variables.
+     plotList <- list()
+     for(i in 1:length(correlatedVariables[,1])){
+          plotList[[i]] <- 
+               ggplot(data=projBuild,aes_string(
+                    as.character(correlatedVariables[i, 1]),
+                    as.character(correlatedVariables[i, 2]))) +
+               geom_point(color="red") + theme_minimal() + 
+               theme(plot.title = element_text(face="bold"));
+          
+          plotList[[i]] <- plotList[[i]] +
+               labs(title = paste("r =", round(eval(parse(
+                    text=paste("cor(projBuild$", plotList[[i]]$labels[[1]],
+                    ", projBuild$", plotList[[i]]$labels[[2]],
+                    ")", sep=""))), 2)))
+     }
+     
+     ## And print the first 3 plots.
+     grid.arrange(plotList[[11]],plotList[[12]], ncol=2)
+     
+       
+```
+
+###Selecting a Model
+
+Initially, the building data was further subsetted into a training set, a testing set and a validation set. A tree model, a random forest model, and a boosted tree model were trained on the training set, and then tested on the test set. They were then combined in a general additive model which was trained on the testing set. Finally, all four models were applied to the validation set to directly compare their results. 
+
+```{r slicingData, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE,cache.lazy=FALSE, fig.align="center", tidy=FALSE, strip.white=TRUE}
+      
+     ## Use parallel processing to speed up calculations.
+     registerDoMC(cores=8)
+     inProjTrain <- createDataPartition(projBuild$classe, p = .7, list=FALSE)
+     
+     projTrain <- projBuild[inProjTrain,]
+      
+     projTestAndValidate <- projBuild[-inProjTrain,]
+     
+     inProjTest <- createDataPartition(projTestAndValidate$classe, p = .5, list=FALSE)
+     
+     projTest <- projTestAndValidate[inProjTest,]
+     
+     projValidate <- projTestAndValidate[-inProjTest,]
+     
+```
+
+```{r emailMe1, echo = FALSE, eval = FALSE, message=FALSE, warning=FALSE, cache=FALSE,cache.lazy=FALSE, opts.label="kill_prefix", tidy=FALSE, strip.white=TRUE, results='hide'}
+     
+     send_message(mime(from="samterfa@gmail.com", to="terfasam@minnehahaacademy.net",
+                  subject="Beginning Tree Model", "Your Calculations have Started"))
+``` 
+
+
+```{r treeModel, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE,cache.lazy=FALSE, fig.align="center", tidy=FALSE, strip.white=TRUE}
+      
+     ## Perform parallel processing to speed up computations.
+     registerDoMC(cores=8)
+      
+     ## Fit a tree model to the training data.
+     rpartProjModel <- train(classe~., method="rpart", data=projTrain, preProcess = c("center", "scale"))
+```  
+
+```{r emailMe2, echo = FALSE, eval = FALSE, message=FALSE, warning=FALSE, cache=FALSE,cache.lazy=FALSE, opts.label="kill_prefix", tidy=FALSE, strip.white=TRUE, results='hide'}
+     
+     send_message(mime(from="samterfa@gmail.com", to="terfasam@minnehahaacademy.net",
+                  subject="Beginning Random Forest", "Your Calculations have Started"))
+``` 
+
+```{r randomForestModel, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE,cache.lazy=FALSE, fig.align="center", tidy=FALSE, strip.white=TRUE}
+      
+     ## Perform parallel processing to speed up computations.
+     registerDoMC(cores=8)
+     
+     ## Fit a random forest model to the training data.
+     rfProjModel <- train(classe~., method="rf", data=projTrain, preProcess = c("center", "scale"))
+```       
+ 
+```{r emailMe3, echo = FALSE, eval = FALSE, message=FALSE, warning=FALSE, cache=FALSE,cache.lazy=FALSE, opts.label="kill_prefix", tidy=FALSE, strip.white=TRUE, results='hide'}
+     
+     send_message(mime(from="samterfa@gmail.com", to="terfasam@minnehahaacademy.net",
+                  subject="Calculations Started!", "Your Calculations have Started"))
+```  
+ 
+```{r boostedTreeModel, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE,cache.lazy=FALSE, fig.align="center", tidy=FALSE, strip.white=TRUE}
+     
+     ## Perform parallel processing to speed up computations.
+     registerDoMC(cores=8)
+      
+     ## Fit a gradient boosting machine to the training data.
+     gbmProjModel <- train(classe~., method="gbm", data=projTrain, preProcess = c("center", "scale"), verbose=FALSE)
+```  
+
+```{r makePredictions, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE, tidy=FALSE, fig.align='center', strip.white=TRUE}
+ 
+     ## Make predictions on the test set.
+     rpartPredTest <- predict(rpartProjModel, projTest)
+     
+     rfPredTest <- predict(rfProjModel, projTest)
+     
+     gbmPredTest <- predict(gbmProjModel, projTest)
+     
+```
+
+```{r applyToTesting, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE, tidy=FALSE, fig.align='center', strip.white=TRUE}
+  
+     ## Combine predictions from 3 models and train on the test set.
+     predDFtest <- data.frame(rpartPredTest, rfPredTest, gbmPredTest, classe = projTest$classe)
+     
+     registerDoMC(cores=4)
+     comboModFit <- train(classe~., method="gam", data=predDFtest)
+     
+     comboPredTest <- predict(comboModFit, predDFtest)
+     
+```
+
+###Validation test results
+
+As can be seen below, the tree model performed the worst on the validation set with an accuracy of 50.77%, the boosted tree model did better at 96.12%, and the random forest performed the best at 99.29%. These 3 models were also combined combined but performed poorly with an accuracy of 65.76%. Since the random forest was the best-performing individual model, and the combination of models did not help, a random forest model was selected going forward.
+
+
+```{r applyToValidation, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE, tidy=FALSE, fig.align='center', strip.white=TRUE}
+
+     ## Make predictions from all 3 models on the validation set.
+     rpartPredValidate <- predict(rpartProjModel, projValidate)
+      
+     rfPredValidate <- predict(rfProjModel, projValidate)
+     
+     gbmPredValidate <- predict(gbmProjModel, projValidate)
+     
+     ## Combine predictions from 3 models and predict on the validation set.
+     predDFvalidate <- data.frame(rpartPredValidate, rfPredValidate, gbmPredValidate, classe=projValidate$classe)
+     
+     comboModFit <- train(classe~., method="rpart", data=predDFvalidate)
+     
+     comboPredValidate <- predict(comboModFit, predDFvalidate)
+    
+```
+
+```{r confusionMatrices, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE, tidy=FALSE, fig.align='center', strip.white=TRUE}
+
+     ## Print Tree Model Results
+     print(confusionMatrix(rpartPredValidate, projValidate$classe))
+      
+     ## Print Random Forest Model Results
+     print(confusionMatrix(rfPredValidate, projValidate$classe))
+     
+     ## Print Boosted Tree Model Results
+     print(confusionMatrix(gbmPredValidate, projValidate$classe))
+     
+     ## Print Combined Model Results
+     print(confusionMatrix(comboPredValidate, projValidate$classe))
+
+```
+
+
+###Model Development and Cross Validation
+
+The trainControl function in the caret package allows model creation to be cross validated so that the out of sample error rate can be estimated and the best paramters selected. A new randomization seed was selected and a random forest model was trained on the building set which was subsetted by the train function into 25 different training-test set pairs using a 632 bootstrapping method for cross validation.
+
+```{r crossValidation, echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE, tidy=FALSE, fig.align='center', strip.white=TRUE}
+
+     set.seed(12345)
+     
+     ## Create instructions for cross-validating train function results.
+     control <- trainControl(method="boot632", number = 25, returnResamp = "all")
+      
+     ## Perform parallel processing to speed up computations.
+     registerDoMC(cores=8)
+     
+     ## Fit a random forest model to the training data.
+     rfControlModel <- train(classe~., method="rf", data=projBuild, preProcess = c("center", "scale"), trControl = control)
+     
+     
+```
+
+
+```{r printControlModel, echo = TRUE, eval = TRUE, message=FALSE, warning=FALSE, cache=FALSE,cache.lazy=FALSE, fig.align="center", tidy=FALSE, strip.white=TRUE}
+##rfProjModel$r
+    
+     print(rfControlModel)
+      
+     confusionMatrix(predict(rfControlModel), projBuild$classe)
+     
+```
+     
+     
+### Results and Test Predictions
+
+As can be seen above in the confusion matrix output, the best run of the random forest model predicted perfectly on the building set. The out of sample error rate, averaged over all runs by the 632 bootstrap method, was estimated to be 1 - 99.57% = .43%. The following code would print out the test predictions.
+
+
+```{r finalPredictions, echo = TRUE, eval = FALSE, message=FALSE, warning=FALSE, cache=TRUE, tidy=FALSE, fig.align='center', strip.white=TRUE}
+ 
+     projTest <- read.csv("pml-testing.csv", stringsAsFactors = FALSE)
+     
+     testSetPredictions <- predict(rfControlModel, projTest)
+     
+     print(testSetPredictions)
+    
+```
+
+
+
+     
+```{r emailMe4, echo = FALSE, eval = FALSE, message=FALSE, warning=FALSE, cache=FALSE,cache.lazy=FALSE, opts.label="kill_prefix", tidy=FALSE, strip.white=TRUE, results='hide'}
+     
+     send_message(mime(from="samterfa@gmail.com", to="terfasam@minnehahaacademy.net",
+                  subject="Everything Finished!", "Your calculations have completed!"))
+``` 
